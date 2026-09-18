@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: resolve-probe
+    runtime: go
+    plan: free
+    buildCommand: go build -o probe .
+    startCommand: ./probe
+    envVars:
+      # Must match build/ci/Dockerfile.jenkins (FROM golang:1.19). The TLS
+      # ClientHello changed in later Go releases, so a probe built with a
+      # different toolchain is not comparable to staging.
+      - key: GO_VERSION
+        value: 1.19.13
+      - key: TARGET_URL
+        value: https://www.tui.se/cdn/media/sys_master/h07/h51/15866047922206/740-425-RIU-TUI-walk-to-beach.jpg

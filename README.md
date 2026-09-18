@@ -1,71 +1,116 @@
-# filestack-test — FS-12651 egress probe
+# resolve-probe — FS-12651
 
-Answers one question: **is Akamai refusing our fetch because of the User-Agent,
-or because of the source IP?**
+Reproduces the **exact** request go-utils makes to an external URL, so the 403
+can be observed from an arbitrary host.
 
-taskrouter fetches customer URLs from go-utils
-`converse/source/resolve.go:makeAndDoRequest`. `www.tui.se` is behind Akamai,
-which returned 403 until that function started sending an explicit User-Agent.
-The fix works from a developer machine; staging still reported 403. A developer
-machine cannot settle that, because it has different egress. **This has to run
-on the same egress address as taskrouter.**
+`makeAndDoRequest` in [`main.go`](main.go) is copied from go-utils
+`converse/source/resolve.go` as deployed
+(`v1.25.1-0.20260917061700-1859b276a5b0`): same `http.Client` with no custom
+`Transport`, same `CheckRedirect`, same `httptrace` HTTP/2 cancel-after-2-writes
+logic, same HTTP/1.1 fallback, same `req.Header.Set("User-Agent", …)` before the
+`Source.Headers` loop. Three deviations, each marked `PROBE:` in the source and
+nothing else.
 
-## Run
+nginx is not involved. This is the first request out of the Go process.
+
+## Endpoints
+
+| endpoint | what it does |
+|---|---|
+| `GET /health` | liveness, plus the Go toolchain the binary was built with |
+| `GET /fetch?variant=fixed` | one attempt, full detail |
+| `GET /diagnose` | every variant in sequence, plus a verdict |
+
+Both accept `?url=…` to override the target.
+
+### Variants
+
+| variant | what it reproduces |
+|---|---|
+| `fixed` | go-utils as deployed today |
+| `prefix` | go-utils **before** FS-12651 — the line is absent and `net/http` supplies its own UA |
+| `empty` | `User-Agent` set to `""` |
+| `browser` | a forwarded end user Chrome UA |
+| `declaredbot` | same `(+url)` shape, unrelated brand |
+| `caller-override` | the fix, then `Source.Headers` overwrites it in the loop |
+
+Every result includes `sentHeaders`, captured with `httptrace.WroteHeaderField`
+— what actually went on the wire, not what we intended to send.
+
+## Run locally
 
 ```sh
-node asset-proxy.js                 # Node 18+, zero dependencies
-PORT=8080 TARGET_URL='https://…' node asset-proxy.js
+go build -o probe . && ./probe
+curl -s localhost:3000/diagnose | jq
+curl -s 'localhost:3000/fetch?variant=prefix' | jq
 ```
+
+## Deploy on Render
+
+Push this directory to a repo, then either commit `render.yaml` and use
+**New → Blueprint**, or create a **New → Web Service** manually with:
+
+- **Runtime** Go
+- **Build command** `go build -o probe .`
+- **Start command** `./probe`
+- **Environment variable** `GO_VERSION` = `1.19.13`
+
+Render supplies `PORT`; the server reads it. The free plan is fine — it sleeps
+when idle, which does not matter for a probe.
 
 ```sh
-curl -s localhost:3000/diagnose | jq .answer
+curl -s https://<your-service>.onrender.com/diagnose | jq '.answer, .results[] | {variant, status}'
 ```
 
-## Reading the result
+> **Pin `GO_VERSION`.** `go 1.19` in `go.mod` sets the *language* version, not
+> the toolchain — build it with anything newer and `/health` will say so. Since
+> the TLS ClientHello changed across Go releases and bot management fingerprints
+> it, only a 1.19 build is comparable to staging.
 
-`answer.conclusion` is one of:
+## Reading `answer`
 
-| conclusion | what it means | what to do |
+| verdict | meaning | next step |
 |---|---|---|
-| `UA_IS_SUFFICIENT_HERE` | the deployed UA fetches the asset from this IP; the pre-fix Go default is refused | the header is not the problem here — check that the running binary actually contains the fix: `strings /taskrouter/taskrouter \| grep 'go-utils v'` |
-| `EGRESS_IP_BLOCKED` | every profile refused, including ones that pass from a clean machine | no header change can fix it; give `answer.akamaiReference` to TUI and ask for an allowlist, or fetch from a different address |
-| `UA_NOT_SUFFICIENT_HERE` | the deployed UA is refused but some other profile passes | diff that profile against what go-utils sends |
-| `UA_IRRELEVANT_HERE` | everything passes, pre-fix request included | this host can't reproduce the failure, so it proves nothing — move to the real egress |
+| `UA_IS_SUFFICIENT_HERE` | the deployed UA works from this IP, pre-fix is refused | the header is fine here — verify the running binary really contains it: `strings /taskrouter/taskrouter \| grep 'go-utils v'` |
+| `EGRESS_IP_BLOCKED` | every variant refused | no header fixes this; send `akamaiReference` to TUI and ask for an allowlist |
+| `UA_NOT_SUFFICIENT_HERE` | deployed UA refused, another variant passes | diff that variant against what go-utils sends |
+| `UA_IRRELEVANT_HERE` | everything passes, pre-fix included | this host can't reproduce it; run from taskrouter's egress |
 
-`answer.akamaiReference` is the id off Akamai's deny page. TUI can hand it to
-Akamai support and get back the exact rule that fired, which settles this
-without further guessing.
+`akamaiReference` is lifted from Akamai's deny page. Give it to TUI — Akamai
+support can name the exact rule that fired, which settles UA-vs-IP outright.
 
-## Profiles
-
-`gonoua`, `filestack`, `emptyua`, `declaredbot` and `curl` mirror the Go client
-exactly — only `Host`, `User-Agent` and `Accept-Encoding: gzip`, because that is
-all `net/http` sends. `none`, `ua`, `browser` and `referer` are browser-shaped
-controls.
-
-`none` is **not** the pre-fix case: Node omits `User-Agent` entirely, while Go
-substitutes `Go-http-client/1.1`. `gonoua` is the real pre-fix request.
-
-## Baseline from a developer machine (2026-09-18)
+Non-200 responses also carry `taskrouterError`, the verbatim message from
+`ResolveExternal`, so results line up with the taskrouter log:
 
 ```
-none 403 · ua 403 · browser 200 · referer 200
-gonoua 403 · filestack 200 · emptyua 403 · declaredbot 200 · curl 200
+external URL is unavailable: https://www.tui.se/…/740-425-RIU-TUI-walk-to-beach.jpg (status 403)
 ```
 
-Three things follow:
+## Baseline from a developer machine (2026-09-18, go1.25.4)
 
-1. `gonoua` 403 → `filestack` 200 confirms the FS-12651 fix is correct.
-2. `declaredbot` 200 shows nothing about Filestack is allowlisted — it is the
-   `<Product>/<version> (+<url>)` declared-crawler shape that passes.
-3. `ua` 403 but `browser` 200: a bare Chrome User-Agent is refused, the same one
-   with a full browser header set is accepted. Akamai checks that the claimed
-   identity matches the rest of the request, so forwarding an end user's
-   User-Agent from a service is worse than sending nothing — which is why nginx
-   must never pass `$http_user_agent` upstream.
+```
+fixed            200   Filestack-Processing-Engine/1.0 (+https://www.filestack.com)
+prefix           403   Go-http-client/2.0
+empty            403   (no User-Agent on the wire)
+browser          403   Mozilla/5.0 … Chrome/140.0.0.0 Safari/537.36
+declaredbot      200   SomethingElse/1.0 (+https://example.com)
+caller-override  403   Mozilla/5.0 … Chrome/140.0.0.0 Safari/537.36
+```
 
-## Caveat
+Four things worth knowing:
 
-Node core speaks HTTP/1.1; the Go client negotiates HTTP/2 with this origin.
-Header-level behaviour matches, but to rule out an HTTP/2- or TLS-fingerprint-
-sensitive rule, reproduce with the Go client itself.
+1. `prefix` sends **`Go-http-client/2.0`**, not `1.1` — the connection negotiates
+   HTTP/2 and `net/http` versions its default UA accordingly.
+2. `empty` puts **no `User-Agent` on the wire at all**. In Go, `Header.Set(k, "")`
+   omits the header rather than sending it blank.
+3. `declaredbot` passes, so nothing about Filestack is allowlisted — it is the
+   `<Product>/<version> (+<url>)` declared-crawler shape that Akamai accepts.
+4. `caller-override` is refused. The `for key, value := range headers` loop runs
+   *after* the fix, so a `User-Agent` in `Source.Headers` silently defeats it —
+   reachable today through the extended-source form
+   `{"url": …, "headers": {…}}`.
+
+## Note
+
+`asset-proxy.js` is the earlier Node probe. It is kept as a cross-check only;
+Node speaks HTTP/1.1 and cannot reproduce the Go client. Trust this one.
