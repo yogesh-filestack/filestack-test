@@ -19,6 +19,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"regexp"
 	"runtime"
@@ -119,7 +120,7 @@ type variant struct {
 
 var variants = []variant{
 	{Name: "fixed", What: "go-utils as deployed today", SetUA: true},
-	{Name: "prefix", What: "go-utils before FS-12651 — net/http supplies Go-http-client/1.1", SetUA: false},
+	{Name: "prefix", What: "go-utils before FS-12651 — net/http supplies Go-http-client/2.0 over h2", SetUA: false},
 	{Name: "empty", What: "User-Agent present but blank", Headers: map[string]string{"User-Agent": ""}},
 	{Name: "browser", What: "a forwarded end user Chrome User-Agent", Headers: map[string]string{"User-Agent": chromeUA}},
 	{Name: "declaredbot", What: "same (+url) shape, unrelated brand", Headers: map[string]string{"User-Agent": "SomethingElse/1.0 (+https://example.com)"}},
@@ -144,6 +145,14 @@ var refRe = regexp.MustCompile(`Reference\s*#\s*([0-9a-f.]+)`)
 // goVersion matters: the TLS ClientHello differs between Go releases, so a
 // result is only comparable to staging if this matches what Jenkins built with.
 func goVersion() string { return runtime.Version() }
+
+func variantNames() string {
+	names := make([]string, 0, len(variants))
+	for _, v := range variants {
+		names = append(names, v.Name)
+	}
+	return strings.Join(names, "|")
+}
 
 // run performs one attempt and reports it the way ResolveExternal would:
 // anything other than 200 becomes the error from the taskrouter log.
@@ -181,13 +190,22 @@ func run(ctx context.Context, target string, v variant) result {
 }
 
 func target(req *http.Request) string {
-	if u := req.URL.Query().Get("url"); u != "" {
-		return u
-	}
+	raw := defaultTarget
 	if u := os.Getenv("TARGET_URL"); u != "" {
-		return u
+		raw = u
 	}
-	return defaultTarget
+	if u := req.URL.Query().Get("url"); u != "" {
+		raw = u
+	}
+
+	// ResolveExternal calls makeAndDoRequest with src.URLExternal.String() — the
+	// URL after net/url has parsed and re-serialised it, not the raw string.
+	// Normalise here too so any escaping difference shows up in the probe rather
+	// than only in production.
+	if u, err := url.Parse(raw); err == nil {
+		return u.String()
+	}
+	return raw
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
@@ -203,6 +221,23 @@ func main() {
 	if port == "" {
 		port = "3000"
 	}
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		code := http.StatusOK
+		if r.URL.Path != "/" {
+			code = http.StatusNotFound
+		}
+		writeJSON(w, code, map[string]interface{}{
+			"service":   "resolve-probe (FS-12651)",
+			"goVersion": goVersion(),
+			"endpoints": map[string]string{
+				"/diagnose": "every variant plus a verdict — start here",
+				"/fetch":    "one attempt, ?variant=" + variantNames(),
+				"/image":    "the deployed request, streamed back — open in a browser",
+				"/health":   "liveness",
+			},
+		})
+	})
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{
@@ -274,6 +309,27 @@ func main() {
 			"answer":    answer,
 			"results":   out,
 		})
+	})
+
+	// /image performs the deployed request and streams the origin's answer back
+	// verbatim — the image itself on 200, Akamai's deny page on 403. Open it in a
+	// browser to see exactly what go-utils sees.
+	http.HandleFunc("/image", func(w http.ResponseWriter, r *http.Request) {
+		wire := []string{}
+		res, err := makeAndDoRequest(r.Context(), http.MethodGet, target(r), nil, true, &wire)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"transportError": err.Error()})
+			return
+		}
+		defer res.Body.Close()
+
+		if ct := res.Header.Get("Content-Type"); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		w.Header().Set("X-Probe-Sent-User-Agent", defaultUserAgent)
+		w.Header().Set("X-Probe-Upstream-Status", fmt.Sprintf("%d", res.StatusCode))
+		w.WriteHeader(res.StatusCode)
+		io.Copy(w, res.Body)
 	})
 
 	log.Printf("resolve-probe listening on :%s (target %s)", port, defaultTarget)
