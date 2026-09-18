@@ -13,9 +13,24 @@
  *   GET /health              liveness
  *   GET /image               streams the asset to you (the actual proxy)
  *   GET /fetch               fetches once, returns JSON: status, headers, timings
- *   GET /fetch?profile=none  pick a header profile (none|ua|browser|referer)
+ *   GET /fetch?profile=none  pick a header profile (see PROFILES below)
  *   GET /fetch?family=4      force IPv4 (or 6)
  *   GET /diagnose            THE ONE YOU WANT — full matrix of tests
+ *
+ * Why this exists (FS-12651): taskrouter fetches customer URLs from go-utils
+ * `converse/source/resolve.go:makeAndDoRequest`. www.tui.se sits behind Akamai,
+ * which answered 403 until that function began sending an explicit User-Agent.
+ * The fix works from a developer machine. It did not appear to work from
+ * staging. The open question is whether Akamai is judging the User-Agent or the
+ * source IP — and that can only be answered by running this from the same
+ * egress address as the service.
+ *
+ * Deploy, then: curl -s localhost:3000/diagnose | jq .answer
+ *
+ * Fidelity caveat: Node core speaks HTTP/1.1, the Go client negotiates HTTP/2
+ * with the same origin. The header-level behaviour matches, but if you need to
+ * rule out an HTTP/2- or TLS-fingerprint-sensitive rule, reproduce with the Go
+ * client itself rather than trusting this.
  */
 
 const http = require('http');
@@ -65,6 +80,52 @@ const PROFILES = {
 
   // Same, plus a Referer from the origin site. Hotlink protection cares.
   referer: null, // filled in below
+
+  // -------------------------------------------------------------------------
+  // Profiles that mirror taskrouter/go-utils byte for byte.
+  //
+  // Go's http.Client sends only Host, User-Agent and Accept-Encoding: gzip —
+  // no Accept, no Accept-Language, no sec-ch-*. Adding browser headers here
+  // would test a request we never ship, so these profiles deliberately carry
+  // nothing the Go client would not send.
+  //
+  // Note `none` above is NOT the pre-fix case: Node omits User-Agent entirely,
+  // whereas Go substitutes its own. `gonoua` is the real pre-fix request.
+  // -------------------------------------------------------------------------
+
+  // go-utils BEFORE FS-12651: makeAndDoRequest set no UA, so Go supplied one.
+  // This is the request that produced `external URL is unavailable (status 403)`.
+  gonoua: {
+    'User-Agent': 'Go-http-client/1.1',
+    'Accept-Encoding': 'gzip',
+  },
+
+  // go-utils AFTER FS-12651, as currently deployed — resolve.go makeAndDoRequest
+  // does req.Header.Set("User-Agent", defaultUserAgent) before the headers loop.
+  filestack: {
+    'User-Agent': 'Filestack-Processing-Engine/1.0 (+https://www.filestack.com)',
+    'Accept-Encoding': 'gzip',
+  },
+
+  // Header present but empty — distinguishes "absent" from "blank".
+  emptyua: {
+    'User-Agent': '',
+    'Accept-Encoding': 'gzip',
+  },
+
+  // Same "<Product>/<version> (+<url>)" shape, unrelated brand. If this passes
+  // while `gonoua` fails, the rule is the declared-crawler shape and nothing
+  // about Filestack is specifically allowlisted.
+  declaredbot: {
+    'User-Agent': 'SomethingElse/1.0 (+https://example.com)',
+    'Accept-Encoding': 'gzip',
+  },
+
+  // curl's identity, so a shell `curl` on the same box is directly comparable.
+  curl: {
+    'User-Agent': 'curl/8.4.0',
+    'Accept-Encoding': 'gzip',
+  },
 };
 
 PROFILES.referer = { ...PROFILES.browser, Referer: 'https://www.tui.se/' };
@@ -203,6 +264,30 @@ function sniffBody(headers, buf, max) {
   };
 }
 
+/**
+ * Akamai's "Access Denied" page HTML-escapes almost every character, so the
+ * reference id has to be unescaped before it can be matched.
+ */
+function unescapeEntities(str) {
+  return String(str)
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * Pull the reference id out of an Akamai deny page.
+ *
+ * This is the single most useful artifact this server produces: TUI can give
+ * it to Akamai support and get back the exact rule that fired — bot category,
+ * WAF rule or rate control — which settles User-Agent vs source IP without any
+ * further black-box probing on our side.
+ */
+function akamaiReference(bodyPreview) {
+  if (!bodyPreview || bodyPreview.kind !== 'text') return null;
+  const m = unescapeEntities(bodyPreview.text).match(/Reference\s*#\s*([0-9a-f.]+)/i);
+  return m ? m[1] : null;
+}
+
 function describeError(err) {
   return {
     code: err.code || null,
@@ -311,6 +396,7 @@ async function diagnose(urlStr) {
       redirects: r.hops.length - 1,
       finalUrl: r.finalUrl !== urlStr ? r.finalUrl : undefined,
       bodyPreview: r.final.bodyPreview,
+      akamaiReference: akamaiReference(r.final.bodyPreview),
       timings: r.final.timings,
       // CDN fingerprints — tells you who is actually refusing you.
       cdn: r.final.headers ? pickCdnHeaders(r.final.headers) : null,
@@ -324,7 +410,9 @@ async function diagnose(urlStr) {
       report.addressFamily.ipv6 = { skipped: 'no AAAA record' };
       continue;
     }
-    const r = await requestOnce(urlStr, { headers: PROFILES.browser, family: fam });
+    // Use the profile we actually ship: if `browser` is bot-blocked (it is, on
+    // this target) an IPv6 "failure" would really just be a 403 in disguise.
+    const r = await requestOnce(urlStr, { headers: PROFILES.filestack, family: fam });
     report.addressFamily[fam === 4 ? 'ipv4' : 'ipv6'] = {
       statusCode: r.statusCode ?? null,
       error: r.error ?? null,
@@ -335,12 +423,17 @@ async function diagnose(urlStr) {
 
   // 5. TLS detail from the browser-profile attempt
   const tlsSample = await requestOnce(urlStr, {
-    headers: PROFILES.browser,
+    headers: PROFILES.filestack,
     method: 'HEAD',
     collectBody: false,
   });
   report.tls = tlsSample.timings.tls || { error: tlsSample.error };
 
+  report.answer = answerUaOrIp(report);
+  report.akamaiReference =
+    Object.values(report.profiles)
+      .map((v) => v.akamaiReference)
+      .find(Boolean) || null;
   report.verdict = verdict(report);
   report.finishedAt = new Date().toISOString();
   return report;
@@ -364,6 +457,87 @@ function pickCdnHeaders(h) {
   const out = {};
   for (const k of keys) if (h[k] !== undefined) out[k] = h[k];
   return Object.keys(out).length ? out : null;
+}
+
+/**
+ * The one question this server exists to answer: from THIS host's egress IP,
+ * is the User-Agent enough to fetch the asset?
+ *
+ * Deploy it on the same egress as taskrouter and read `answer.conclusion`.
+ */
+function answerUaOrIp(r) {
+  const p = r.profiles;
+  const code = (n) => (p[n] ? p[n].statusCode : null);
+
+  const fix = code('filestack'); // what go-utils sends today
+  const preFix = code('gonoua'); // what it sent before FS-12651
+  const passing = Object.entries(p)
+    .filter(([, v]) => v.statusCode === 200)
+    .map(([k]) => k);
+
+  if (fix === 200 && preFix !== 200) {
+    return {
+      conclusion: 'UA_IS_SUFFICIENT_HERE',
+      statusByProfile: statusMap(p),
+      meaning:
+        'The deployed User-Agent fetches the asset from this egress IP, and the pre-fix ' +
+        'Go default is refused. Akamai is deciding on the User-Agent alone and this IP is ' +
+        'not itself blocked.',
+      soWhat:
+        'If taskrouter still returns 403 from an environment with comparable egress, the ' +
+        'running binary is not sending the header. Verify what is actually linked in: ' +
+        'strings /taskrouter/taskrouter | grep "go-utils v"',
+    };
+  }
+
+  if (fix === 200 && preFix === 200) {
+    return {
+      conclusion: 'UA_IRRELEVANT_HERE',
+      statusByProfile: statusMap(p),
+      meaning:
+        'Every request succeeds from this IP, including the pre-fix one. This host cannot ' +
+        'reproduce the failure at all.',
+      soWhat:
+        'It therefore tells you nothing about the staging 403. Re-run from the same egress ' +
+        'address as the failing service.',
+    };
+  }
+
+  if (passing.length === 0) {
+    return {
+      conclusion: 'EGRESS_IP_BLOCKED',
+      statusByProfile: statusMap(p),
+      meaning:
+        'Every profile is refused, including ones that succeed from a clean developer ' +
+        'machine. The block is on this source IP, not on the header.',
+      soWhat:
+        'No User-Agent change can fix this. TUI must allowlist the egress range, or the ' +
+        'fetch has to leave from a different address. Quote answer.akamaiReference to TUI ' +
+        'so Akamai can name the rule that fired.',
+    };
+  }
+
+  if (fix !== 200) {
+    return {
+      conclusion: 'UA_NOT_SUFFICIENT_HERE',
+      statusByProfile: statusMap(p),
+      meaning:
+        `The deployed User-Agent is refused (${fix}) from this IP, but these profiles pass: ` +
+        `${passing.join(', ')}. The classifier is weighing more than the header from this ` +
+        'source, so a fix validated on a developer machine is not enough here.',
+      soWhat:
+        'Diff a passing profile against what go-utils sends and close the gap, or treat it ' +
+        'as an IP-reputation problem and talk to TUI.',
+    };
+  }
+
+  return { conclusion: 'INCONCLUSIVE', statusByProfile: statusMap(p) };
+}
+
+function statusMap(p) {
+  return Object.fromEntries(
+    Object.entries(p).map(([k, v]) => [k, v.statusCode || (v.error && v.error.code) || null]),
+  );
 }
 
 /** Plain-English reading of the report. */
@@ -403,10 +577,30 @@ function verdict(r) {
     );
   }
 
-  if (p.none.statusCode !== 200 && p.browser.statusCode === 200) {
+  if (p.gonoua.statusCode !== 200 && p.filestack.statusCode === 200) {
     notes.push(
-      'Fails with no headers, succeeds with browser headers. The CDN is doing bot ' +
-        'filtering on User-Agent. Send a realistic User-Agent and Accept from your service.',
+      'The pre-fix Go default User-Agent is refused and the Filestack one succeeds, so ' +
+        'this target is bot-filtering on User-Agent and the FS-12651 fix is effective here.',
+    );
+  }
+
+  if (p.ua.statusCode !== 200 && p.browser.statusCode === 200) {
+    notes.push(
+      'A bare Chrome User-Agent is refused but the same User-Agent with a full browser ' +
+        'header set (Accept, Accept-Language, Sec-Fetch-*, sec-ch-ua) succeeds. The ' +
+        'classifier checks that the claimed identity matches the rest of the request, so ' +
+        'forwarding a browser User-Agent from a service — which sends none of those other ' +
+        'headers — scores as a spoofing bot and is worse than sending nothing. Exactly the ' +
+        'reason nginx must not pass $http_user_agent upstream.',
+    );
+  }
+
+  if (p.declaredbot.statusCode === 200 && p.gonoua.statusCode !== 200) {
+    notes.push(
+      'A generic "<Product>/<version> (+<url>)" agent from an unrelated domain passes while ' +
+        'the Go default is refused. Nothing about Filestack is specifically allowlisted — it ' +
+        'is the declared-crawler shape that is accepted, so the fix rests on the format of ' +
+        'the User-Agent rather than on any arrangement with TUI.',
     );
   }
 
@@ -417,7 +611,8 @@ function verdict(r) {
     );
   }
 
-  if (noneOk && [401, 403].includes(p.referer.statusCode)) {
+  const allDenied = Object.values(p).every((v) => [401, 403].includes(v.statusCode));
+  if (allDenied) {
     notes.push(
       `All profiles return ${p.referer.statusCode}. Headers are not the issue — the CDN is ` +
         'rejecting this source IP. Datacenter/cloud ranges are commonly blocked by bot ' +
@@ -503,8 +698,8 @@ const server = http.createServer(async (req, res) => {
         target: TARGET_URL,
         endpoints: {
           '/image': 'stream the asset through this server',
-          '/fetch': 'one attempt, JSON result (?profile=none|ua|browser|referer, ?family=4|6)',
-          '/diagnose': 'full diagnostic matrix — start here',
+          '/fetch': `one attempt, JSON result (?profile=${Object.keys(PROFILES).join('|')}, ?family=4|6)`,
+          '/diagnose': 'full diagnostic matrix — start here; read .answer.conclusion',
           '/health': 'liveness',
         },
       });
@@ -516,7 +711,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/fetch') {
-      const profile = q.get('profile') || 'browser';
+      const profile = q.get('profile') || 'filestack';
       if (!PROFILES[profile]) {
         return json(res, 400, { error: `unknown profile`, valid: Object.keys(PROFILES) });
       }
@@ -532,7 +727,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/image') {
-      return streamAsset(target, q.get('profile') || 'browser', res);
+      return streamAsset(target, q.get('profile') || 'filestack', res);
     }
 
     return json(res, 404, { error: 'not found', try: '/diagnose' });
@@ -549,7 +744,7 @@ function streamAsset(urlStr, profileName, res, depth = 0) {
 
   const url = new URL(urlStr);
   const lib = url.protocol === 'https:' ? https : http;
-  const headers = { Host: url.hostname, ...(PROFILES[profileName] || PROFILES.browser) };
+  const headers = { Host: url.hostname, ...(PROFILES[profileName] || PROFILES.filestack) };
   // We are decoding nothing ourselves, so do not ask for br/gzip on a binary.
   delete headers['Accept-Encoding'];
 
